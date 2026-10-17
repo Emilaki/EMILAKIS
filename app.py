@@ -3,6 +3,8 @@
 from flask import Flask, jsonify, make_response, request, send_from_directory
 from pathlib import Path
 import hashlib, hmac, json, os, re, secrets, sqlite3, time
+from urllib.parse import urlparse
+import requests
 
 ROOT = Path(__file__).resolve().parent
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -10,6 +12,15 @@ ADMIN_TOKEN = os.environ.get("EA_ADMIN_TOKEN", "")
 MIN_WITHDRAW = 50
 DAILY_LIMIT = 500
 COOKIE_SECURE = os.environ.get("EA_HTTPS", "0") == "1"
+MPESA_ENV = os.environ.get("MPESA_ENV", "sandbox").strip().lower()
+MPESA_B2C_ENABLED = os.environ.get("MPESA_B2C_ENABLED", "false").strip().lower() == "true"
+MPESA_CONSUMER_KEY = os.environ.get("MPESA_CONSUMER_KEY", "").strip()
+MPESA_CONSUMER_SECRET = os.environ.get("MPESA_CONSUMER_SECRET", "").strip()
+MPESA_B2C_SHORTCODE = os.environ.get("MPESA_B2C_SHORTCODE", "").strip()
+MPESA_INITIATOR_NAME = os.environ.get("MPESA_INITIATOR_NAME", "").strip()
+MPESA_SECURITY_CREDENTIAL = (os.environ.get("MPESA_SECURITY_CREDENTIAL") or os.environ.get("MPESA_B2C_SECURITY_CREDENTIAL") or "").strip()
+# Deliberately fixed to Safaricom's sandbox: this starter cannot send live money.
+MPESA_SANDBOX_URL = "https://sandbox.safaricom.co.ke"
 TASKS = [
     {"id":"quiz","title":"Money-smart mini quiz","description":"A short budgeting knowledge check.","reward":10,"minutes":3},
     {"id":"learn","title":"Learn something new","description":"Read a short saving guide and answer a question.","reward":20,"minutes":5},
@@ -66,7 +77,67 @@ def init_db():
     with db() as c:
         for statement in schema:
             c.execute(statement)
+        if c.is_pg:
+            for column in ("msisdn", "originator_id", "conversation_id", "transaction_id", "result_code", "result_desc"):
+                c.execute(f"ALTER TABLE payouts ADD COLUMN IF NOT EXISTS {column} TEXT")
+        else:
+            existing={r["name"] for r in c.execute("PRAGMA table_info(payouts)").fetchall()}
+            for column in ("msisdn", "originator_id", "conversation_id", "transaction_id", "result_code", "result_desc"):
+                if column not in existing:
+                    c.execute(f"ALTER TABLE payouts ADD COLUMN {column} TEXT")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS payouts_originator_idx ON payouts(originator_id)")
         c.execute("DELETE FROM sessions WHERE expires < ?", (int(time.time()),))
+
+def mpesa_sandbox_ready():
+    base=os.environ.get("MPESA_PUBLIC_BASE_URL", os.environ.get("RENDER_EXTERNAL_URL", "")).strip().rstrip("/")
+    parsed=urlparse(base)
+    return bool(
+        MPESA_B2C_ENABLED and MPESA_ENV == "sandbox" and MPESA_CONSUMER_KEY and
+        MPESA_CONSUMER_SECRET and MPESA_B2C_SHORTCODE and MPESA_INITIATOR_NAME and
+        MPESA_SECURITY_CREDENTIAL and parsed.scheme == "https" and parsed.netloc
+    )
+
+def normalize_msisdn(value):
+    digits=re.sub(r"[\s()+-]", "", str(value or ""))
+    if digits.startswith("0") and len(digits)==10:
+        digits="254"+digits[1:]
+    elif digits.startswith("7") or digits.startswith("1"):
+        if len(digits)==9: digits="254"+digits
+    if not re.fullmatch(r"254[17]\d{8}",digits):
+        raise ValueError("Enter a valid Kenyan M-Pesa number, for example 07XXXXXXXX or 2547XXXXXXXX.")
+    return digits
+
+def mpesa_request(payout_id, msisdn, amount, originator_id):
+    """Send one explicitly admin-triggered B2C request to sandbox only."""
+    auth=requests.get(
+        MPESA_SANDBOX_URL+"/oauth/v1/generate?grant_type=client_credentials",
+        auth=(MPESA_CONSUMER_KEY,MPESA_CONSUMER_SECRET), timeout=(5,20), allow_redirects=False,
+    )
+    auth.raise_for_status()
+    access_token=auth.json().get("access_token")
+    if not access_token:
+        raise RuntimeError("Daraja did not return an access token.")
+    public_base=os.environ.get("MPESA_PUBLIC_BASE_URL",os.environ.get("RENDER_EXTERNAL_URL","")).strip().rstrip("/")
+    if urlparse(public_base).scheme != "https":
+        raise RuntimeError("Set MPESA_PUBLIC_BASE_URL to the public HTTPS website URL.")
+    body={
+        "InitiatorName":MPESA_INITIATOR_NAME,
+        "SecurityCredential":MPESA_SECURITY_CREDENTIAL,
+        "CommandID":"BusinessPayment",
+        "Amount":int(amount),
+        "PartyA":MPESA_B2C_SHORTCODE,
+        "PartyB":msisdn,
+        "Remarks":f"EA EarnHub payout {payout_id}",
+        "QueueTimeOutURL":public_base+"/api/mpesa/b2c/timeout",
+        "ResultURL":public_base+"/api/mpesa/b2c/result",
+        "Occassion":"EA EarnHub sandbox",
+        "OriginatorConversationID":originator_id,
+    }
+    return requests.post(
+        MPESA_SANDBOX_URL+"/mpesa/b2c/v3/paymentrequest", json=body,
+        headers={"Authorization":"Bearer "+access_token,"Content-Type":"application/json"},
+        timeout=(5,25), allow_redirects=False,
+    )
 
 def digest(token):
     return hashlib.sha256(token.encode()).hexdigest()
@@ -107,6 +178,7 @@ def payload():
     return request.get_json(silent=True) or {}
 
 app=Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"]=64*1024
 
 @app.after_request
 def security_headers(response):
@@ -124,7 +196,7 @@ def home():
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="pilot",payments="disabled",adminConfigured=bool(ADMIN_TOKEN))
+    return jsonify(status="pilot",payments="sandbox-only" if mpesa_sandbox_ready() else "disabled",adminConfigured=bool(ADMIN_TOKEN))
 
 @app.get("/api/me")
 def me():
@@ -152,10 +224,10 @@ def activity():
 def admin_overview():
     require_admin()
     with db() as c:
-        payouts=c.execute("SELECT p.id,p.amount,p.status,p.created,u.name,u.email FROM payouts p JOIN users u ON u.id=p.user_id ORDER BY p.id DESC LIMIT 50").fetchall()
+        payouts=c.execute("SELECT p.id,p.amount,p.status,p.created,p.msisdn,p.transaction_id,p.result_desc,u.name,u.email FROM payouts p JOIN users u ON u.id=p.user_id ORDER BY p.id DESC LIMIT 50").fetchall()
         claims=c.execute("SELECT cl.user_id,cl.task_id,cl.created,u.name,u.email FROM claims cl JOIN users u ON u.id=cl.user_id WHERE cl.status='pending' ORDER BY cl.created LIMIT 50").fetchall()
         users=c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-        return jsonify(rewardPool=reward_pool(c),users=users,payouts=[dict(r) for r in payouts],claims=[dict(r) for r in claims],tasks=TASKS,paymentsEnabled=False)
+        return jsonify(rewardPool=reward_pool(c),users=users,payouts=[dict(r) for r in payouts],claims=[dict(r) for r in claims],tasks=TASKS,paymentsEnabled=mpesa_sandbox_ready(),mpesaMode="sandbox" if mpesa_sandbox_ready() else "disabled")
 
 @app.post("/api/signup")
 def signup():
@@ -247,6 +319,8 @@ def withdraw():
     amount=data.get("amount")
     if not isinstance(amount,int) or amount<MIN_WITHDRAW: return jsonify(error="Minimum withdrawal is KSh 50."),400
     if amount>DAILY_LIMIT: return jsonify(error="Maximum withdrawal is KSh 500 per day."),400
+    try: msisdn=normalize_msisdn(data.get("phone"))
+    except ValueError as exc: return jsonify(error=str(exc)),400
     try:
         with db() as c:
             u=require_user(c)
@@ -259,12 +333,104 @@ def withdraw():
                 c.execute("ROLLBACK")
                 return jsonify(error="Your confirmed balance is too low."),400
             now=int(time.time())
-            cur=c.execute("INSERT INTO payouts(user_id,amount,status,created,updated) VALUES(?,?,'queued',?,?) RETURNING id",(u["id"],amount,now,now))
+            cur=c.execute("INSERT INTO payouts(user_id,amount,status,created,updated,msisdn) VALUES(?,?,'queued',?,?,?) RETURNING id",(u["id"],amount,now,now,msisdn))
             payout_id=cur.fetchone()["id"]
             add_ledger(c,u["id"],-amount,"withdrawal","Withdrawal request #"+str(payout_id))
             c.execute("COMMIT")
-            return jsonify(ok=True,status="queued",message="Request queued for review. No money has been sent."),201
+            return jsonify(ok=True,status="queued",message="Request queued for operator review. A sandbox test, if enabled, does not move real money."),201
     except Exception as exc: return db_error(exc)
+
+@app.post("/api/admin/payout/send-sandbox")
+def admin_send_sandbox_payout():
+    require_admin()
+    if not mpesa_sandbox_ready():
+        return jsonify(error="Sandbox payouts are disabled or incomplete. Check the Daraja sandbox settings and HTTPS callback URL."),503
+    pid=payload().get("id")
+    try: pid=int(pid)
+    except (TypeError,ValueError): return jsonify(error="Invalid payout request."),400
+    originator_id=secrets.token_urlsafe(24)
+    try:
+        with db() as c:
+            c.execute("BEGIN")
+            cur=c.execute("UPDATE payouts SET status='initiating',originator_id=?,updated=? WHERE id=? AND status='queued' AND msisdn IS NOT NULL",(originator_id,int(time.time()),pid))
+            if cur.rowcount != 1:
+                c.execute("ROLLBACK")
+                return jsonify(error="Queued payout not found, phone number missing, or payout already submitted."),409
+            payout=c.execute("SELECT amount,msisdn,user_id FROM payouts WHERE id=?",(pid,)).fetchone()
+            c.execute("COMMIT")
+        try:
+            response=mpesa_request(pid,payout["msisdn"],payout["amount"],originator_id)
+            try: result=response.json()
+            except ValueError: result={}
+            if response.status_code >= 500 or not isinstance(result,dict) or "ResponseCode" not in result:
+                with db() as c: c.execute("UPDATE payouts SET status='unknown',updated=?,result_desc=? WHERE id=? AND status='initiating'",(int(time.time()),"Daraja response was inconclusive; reconcile in the Daraja simulator before retrying.",pid))
+                return jsonify(ok=True,status="unknown",message="Daraja's response was inconclusive. Do not resend until you reconcile the request in the Daraja portal."),202
+            if response.status_code >= 400 or str(result.get("ResponseCode")) != "0":
+                desc=str(result.get("errorMessage") or result.get("ResponseDescription") or "Daraja rejected the sandbox request.")[:240]
+                with db() as c:
+                    c.execute("BEGIN")
+                    cur=c.execute("UPDATE payouts SET status='failed',updated=?,result_desc=? WHERE id=? AND status='initiating'",(int(time.time()),desc,pid))
+                    if cur.rowcount:
+                        add_ledger(c, payout["user_id"], payout["amount"], "refund", "Sandbox payout request rejected")
+                    c.execute("COMMIT")
+                return jsonify(error="Daraja rejected the sandbox request. The reserved balance was refunded."),502
+            conversation=str(result.get("ConversationID") or "")[:120]
+            desc=str(result.get("ResponseDescription") or "Request accepted by Daraja sandbox; awaiting callback.")[:240]
+            with db() as c:
+                c.execute("UPDATE payouts SET status='pending',conversation_id=?,updated=?,result_desc=? WHERE id=? AND status='initiating'",(conversation,int(time.time()),desc,pid))
+            return jsonify(ok=True,status="pending",message="Sandbox request accepted. Waiting for Safaricom's result callback; this is not a real payout."),202
+        except requests.Timeout:
+            with db() as c: c.execute("UPDATE payouts SET status='unknown',updated=?,result_desc=? WHERE id=? AND status='initiating'",(int(time.time()),"Network timeout after request; reconcile in the Daraja portal before retrying.",pid))
+            return jsonify(ok=True,status="unknown",message="The request timed out and may have reached Daraja. Reconcile it in the portal before any retry."),202
+        except requests.RequestException:
+            with db() as c: c.execute("UPDATE payouts SET status='unknown',updated=?,result_desc=? WHERE id=? AND status='initiating'",(int(time.time()),"Network result was inconclusive; reconcile in the Daraja portal before retrying.",pid))
+            return jsonify(ok=True,status="unknown",message="The network result is uncertain. Reconcile in the Daraja portal before retrying."),202
+        except Exception as exc:
+            app.logger.warning("Sandbox payout %s could not be processed: %s",pid,type(exc).__name__)
+            with db() as c: c.execute("UPDATE payouts SET status='unknown',updated=?,result_desc=? WHERE id=? AND status='initiating'",(int(time.time()),"Processing result is uncertain; reconcile in the Daraja portal before retrying.",pid))
+            return jsonify(ok=True,status="unknown",message="The request result is uncertain. Reconcile it in the Daraja portal before retrying."),202
+    except Exception as exc: return db_error(exc)
+
+def settle_mpesa_callback(data, timed_out=False):
+    result=data.get("Result") if isinstance(data,dict) else None
+    if not isinstance(result,dict): return False
+    originator=str(result.get("OriginatorConversationID") or "")[:120]
+    if not originator: return False
+    now=int(time.time())
+    with db() as c:
+        c.execute("BEGIN")
+        payout=c.execute("SELECT id,user_id,amount,status FROM payouts WHERE originator_id=?",(originator,)).fetchone()
+        if not payout or payout["status"] not in ("initiating","pending","unknown"):
+            c.execute("ROLLBACK")
+            return False
+        if timed_out:
+            status="unknown"
+            code="timeout"
+            desc="Daraja reported a queue timeout. Reconcile before retrying."
+        else:
+            code=str(result.get("ResultCode", "unknown"))[:50]
+            desc=str(result.get("ResultDesc") or "Daraja returned a transaction result.")[:240]
+            status="paid" if code=="0" else "failed"
+        transaction_id=""
+        params=result.get("ResultParameters",{}).get("ResultParameter",[]) if isinstance(result.get("ResultParameters"),dict) else []
+        if isinstance(params,list):
+            transaction_id=next((str(item.get("Value"))[:120] for item in params if isinstance(item,dict) and item.get("Key")=="TransactionReceipt" and item.get("Value")),"")
+        cur=c.execute("UPDATE payouts SET status=?,result_code=?,result_desc=?,transaction_id=?,conversation_id=COALESCE(NULLIF(?,''),conversation_id),updated=? WHERE id=? AND status IN ('initiating','pending','unknown')",(status,code,desc,transaction_id,str(result.get("ConversationID") or "")[:120],now,payout["id"]))
+        if cur.rowcount and status=="failed":
+            add_ledger(c,payout["user_id"],payout["amount"],"refund","M-Pesa payout failed; withdrawal refunded")
+        c.execute("COMMIT")
+        return bool(cur.rowcount)
+
+@app.post("/api/mpesa/b2c/result")
+def mpesa_b2c_result():
+    accepted=settle_mpesa_callback(request.get_json(silent=True) or {})
+    # Acknowledge callbacks even if they are duplicates or unmatched; no PII is returned.
+    return jsonify(ok=accepted),200
+
+@app.post("/api/mpesa/b2c/timeout")
+def mpesa_b2c_timeout():
+    accepted=settle_mpesa_callback(request.get_json(silent=True) or {},timed_out=True)
+    return jsonify(ok=accepted),200
 
 @app.post("/api/admin/fund")
 def admin_fund():
@@ -309,7 +475,7 @@ def admin_claim():
 def admin_payout():
     require_admin()
     data=payload(); pid=data.get("id"); status=data.get("status")
-    if status not in ("paid","cancelled"): return jsonify(error="Choose paid or cancelled."),400
+    if status != "cancelled": return jsonify(error="A payout can only be marked paid by a successful Daraja result callback."),400
     try:
         with db() as c:
             c.execute("BEGIN")
@@ -317,9 +483,30 @@ def admin_payout():
             if not p or p["status"]!="queued":
                 c.execute("ROLLBACK"); return jsonify(error="Queued payout not found."),400
             c.execute("UPDATE payouts SET status=?,updated=? WHERE id=?",(status,int(time.time()),pid))
-            if status=="cancelled": add_ledger(c,p["user_id"],p["amount"],"refund","Cancelled withdrawal request #"+str(pid))
+            add_ledger(c,p["user_id"],p["amount"],"refund","Cancelled withdrawal request #"+str(pid))
             c.execute("COMMIT")
             return jsonify(ok=True,status=status)
+    except Exception as exc: return db_error(exc)
+
+@app.post("/api/admin/payout/reconcile")
+def admin_reconcile_sandbox_payout():
+    require_admin()
+    data=payload(); pid=data.get("id"); outcome=data.get("outcome")
+    if outcome not in ("paid","failed"):
+        return jsonify(error="Choose the confirmed Daraja sandbox result: paid or failed."),400
+    try:
+        with db() as c:
+            c.execute("BEGIN")
+            p=c.execute("SELECT * FROM payouts WHERE id=?",(pid,)).fetchone()
+            if not p or p["status"] not in ("unknown","pending"):
+                c.execute("ROLLBACK"); return jsonify(error="Only an unresolved Daraja sandbox request can be reconciled."),409
+            code="manual-confirmed-success" if outcome=="paid" else "manual-confirmed-failure"
+            desc="Operator reconciled against the Daraja sandbox simulator."
+            cur=c.execute("UPDATE payouts SET status=?,result_code=?,result_desc=?,updated=? WHERE id=? AND status IN ('unknown','pending')",(outcome,code,desc,int(time.time()),pid))
+            if cur.rowcount and outcome=="failed":
+                add_ledger(c,p["user_id"],p["amount"],"refund","Daraja sandbox failure confirmed; withdrawal refunded")
+            c.execute("COMMIT")
+            return jsonify(ok=True,status=outcome)
     except Exception as exc: return db_error(exc)
 
 @app.errorhandler(PermissionError)
@@ -351,7 +538,6 @@ def db_error(exc):
 if __name__ == "__main__":
     init_db()
     app.run(host=os.environ.get("EA_HOST","127.0.0.1"),port=int(os.environ.get("PORT",os.environ.get("EA_PORT","8000"))))
-
 
 # Render starts this module through Gunicorn, which does not run the __main__ block.
 # Initialize the persistent schema when a WSGI server imports this module.

@@ -1,22 +1,3 @@
-services:
-  - type: web
-    name: ea-earnhub
-    runtime: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
-    healthCheckPath: /api/health
-    envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: ea-earnhub-db
-          property: connectionString
-      - key: EA_ADMIN_TOKEN
-        generateValue: true
-      - key: EA_HTTPS
-        value: "1"
-databases:
-  - name: ea-earnhub-db
-    databaseName: ea_earnhub
-    user: ea_earnhub
-    plan: free
+flask
+gunicorn
+requests

@@ -351,3 +351,9 @@ def db_error(exc):
 if __name__ == "__main__":
     init_db()
     app.run(host=os.environ.get("EA_HOST","127.0.0.1"),port=int(os.environ.get("PORT",os.environ.get("EA_PORT","8000"))))
+
+
+# Render starts this module through Gunicorn, which does not run the __main__ block.
+# Initialize the persistent schema when a WSGI server imports this module.
+if __name__ != "__main__":
+    init_db()
